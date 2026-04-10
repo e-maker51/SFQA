@@ -465,41 +465,72 @@ If the context doesn't contain relevant information, answer based on your genera
             
             # Save user message
             user_msg = self.add_message(conversation_id, 'user', user_message)
-            
-            # Stage 1: Classify question (fast, no thinking)
-            yield self._sse_event('status', {'message': 'Analyzing question...'})
-            classifier = QuestionClassifier(self.ollama_service)
-            classification = classifier.classify(user_message, base_model)
+
+            # Immediately notify client that processing has started
+            yield self._sse_event('status', {'message': 'Processing...'})
+
+            # Stage 1 & 2: Parallel classification and RAG context retrieval
+            # This reduces latency by doing both operations concurrently
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+
+            def classify_question():
+                """Classify question in background thread"""
+                try:
+                    classifier = QuestionClassifier(self.ollama_service)
+                    return classifier.classify(user_message, base_model)
+                except Exception as e:
+                    logger.warning(f"Classification failed: {e}")
+                    return {'type': 'KNOWLEDGE', 'keywords': []}
+
+            def get_context():
+                """Get RAG context in background thread"""
+                try:
+                    if effective_custom_model_id:
+                        return self.get_rag_context(user_message, effective_custom_model_id)
+                    return '', []
+                except Exception as e:
+                    logger.warning(f"RAG context retrieval failed: {e}")
+                    return '', []
+
+            # Execute classification and context retrieval in parallel
+            classification = {'type': 'KNOWLEDGE', 'keywords': []}
+            context, sources = '', []
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                classify_future = executor.submit(classify_question)
+                context_future = executor.submit(get_context)
+
+                # Wait for both to complete
+                for future in as_completed([classify_future, context_future]):
+                    try:
+                        result = future.result()
+                        if future == classify_future:
+                            classification = result
+                            question_type = classification.get('type', 'KNOWLEDGE')
+                            logger.info(f"Question classified as: {question_type}")
+                        else:
+                            context, sources = result
+                    except Exception as e:
+                        logger.error(f"Parallel processing error: {e}")
 
             question_type = classification.get('type', 'KNOWLEDGE')
             keywords = classification.get('keywords', [])
 
-            logger.info(f"Question classified as: {question_type}, keywords: {keywords}")
-
-            # Stage 2: Based on classification, decide RAG usage
+            # Stage 3: Build messages based on classification
             if question_type == 'SYSTEM':
-                context, sources = '', []
-                yield self._sse_event('status', {'message': 'Handling system question...'})
-
-                # For SYSTEM questions, use a clean prompt without RAG context
+                yield self._sse_event('status', {'message': 'Generating response...'})
                 messages = self._build_system_prompt(user_message, system_prompt)
-
-                # Prepend minimal conversation history (only assistant's identity info)
                 history = self.get_conversation_history(conversation_id, limit=2)
                 if len(history) > 1:
-                    # Only keep the last user message before this one
                     for msg in history[:-1]:
                         if msg['role'] == 'user':
                             messages.insert(1, msg)
                             break
 
             elif question_type == 'KNOWLEDGE':
-                yield self._sse_event('status', {'message': 'Searching knowledge base...'})
-                context, sources = self.get_rag_context(user_message, effective_custom_model_id)
                 if sources:
                     yield self._sse_event('sources', {'sources': sources})
-
-                # Get conversation history
+                yield self._sse_event('status', {'message': 'Generating response...'})
                 history = self.get_conversation_history(conversation_id, limit=10)
                 messages = self.build_prompt_with_context(user_message, context, sources, system_prompt)
                 if len(history) > 1:
@@ -507,27 +538,41 @@ If the context doesn't contain relevant information, answer based on your genera
                         messages.insert(1, msg)
 
             else:
-                context, sources = '', []
                 yield self._sse_event('status', {'message': 'Generating response...'})
                 messages = self._build_system_prompt(user_message, system_prompt)
             
             # Start streaming response
             yield self._sse_event('status', {'message': 'Generating response...'})
-            
+
             full_content = ''
             thinking_content = ''
             is_thinking = False
             thinking_started_at = None
             thinking_duration = 0
-            
+
+            # Create a placeholder assistant message at the start to ensure data integrity
+            # This message will be updated incrementally during streaming
+            assistant_msg = self.add_message(
+                conversation_id,
+                'assistant',
+                '',  # Start with empty content
+                thinking_content='',
+                sources=sources if sources else None
+            )
+            assistant_message_id = assistant_msg.id
+
+            # Track last save time for incremental saves (every 2 seconds)
+            last_save_time = time.time()
+            save_interval = 2.0  # Save every 2 seconds
+
             for chunk in self.ollama_service.chat_stream(base_model, messages):
                 if 'message' in chunk:
                     msg = chunk['message']
-                    
+
                     # Handle thinking field (Ollama think=True returns separate field)
                     thinking_token = msg.get('thinking', '')
                     content_token = msg.get('content', '')
-                    
+
                     if thinking_token:
                         if not is_thinking:
                             is_thinking = True
@@ -535,7 +580,7 @@ If the context doesn't contain relevant information, answer based on your genera
                             yield self._sse_event('thinking_start', {})
                         thinking_content += thinking_token
                         yield self._sse_event('thinking', {'content': thinking_token})
-                    
+
                     if content_token:
                         if is_thinking:
                             is_thinking = False
@@ -546,7 +591,19 @@ If the context doesn't contain relevant information, answer based on your genera
                             })
                         full_content += content_token
                         yield self._sse_event('content', {'content': content_token})
-                
+
+                    # Incremental save: update message in database every 2 seconds
+                    current_time = time.time()
+                    if current_time - last_save_time >= save_interval:
+                        try:
+                            assistant_msg.content = full_content
+                            assistant_msg.thinking_content = thinking_content if thinking_content else None
+                            db.session.commit()
+                            last_save_time = current_time
+                        except Exception as save_error:
+                            logger.warning(f"Incremental save failed: {save_error}")
+                            db.session.rollback()
+
                 if chunk.get('done', False):
                     # If still in thinking mode when done, close it
                     if is_thinking:
@@ -557,15 +614,24 @@ If the context doesn't contain relevant information, answer based on your genera
                             'duration': thinking_duration
                         })
                     break
-            
-            # Save assistant message
-            assistant_msg = self.add_message(
-                conversation_id, 
-                'assistant', 
-                full_content,
-                thinking_content=thinking_content if thinking_content else None,
-                sources=sources if sources else None
-            )
+
+            # Final save of the complete message
+            try:
+                assistant_msg.content = full_content
+                assistant_msg.thinking_content = thinking_content if thinking_content else None
+                db.session.commit()
+            except Exception as save_error:
+                logger.error(f"Final message save failed: {save_error}")
+                db.session.rollback()
+                # Try one more time with fresh session
+                try:
+                    assistant_msg = Message.query.get(assistant_message_id)
+                    if assistant_msg:
+                        assistant_msg.content = full_content
+                        assistant_msg.thinking_content = thinking_content if thinking_content else None
+                        db.session.commit()
+                except Exception as retry_error:
+                    logger.error(f"Retry save failed: {retry_error}")
             
             # Auto-generate title if it's the first exchange
             if conversation.title == 'New Conversation':
@@ -688,51 +754,90 @@ If the context doesn't contain relevant information, answer based on your genera
                         conversation.custom_model_id = effective_custom_model_id
                         db.session.commit()
             
-            # Get RAG context
-            # Stage 1: Classify question (fast, no thinking)
-            yield self._sse_event('status', {'message': 'Analyzing question...'})
-            classifier = QuestionClassifier(self.ollama_service)
-            classification = classifier.classify(user_message, base_model)
+            # Parallel classification and RAG context retrieval
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+
+            def classify_question():
+                try:
+                    classifier = QuestionClassifier(self.ollama_service)
+                    return classifier.classify(user_message, base_model)
+                except Exception as e:
+                    logger.warning(f"Classification failed: {e}")
+                    return {'type': 'KNOWLEDGE', 'keywords': []}
+
+            def get_context():
+                try:
+                    if effective_custom_model_id:
+                        return self.get_rag_context(user_message, effective_custom_model_id)
+                    return '', []
+                except Exception as e:
+                    logger.warning(f"RAG context retrieval failed: {e}")
+                    return '', []
+
+            classification = {'type': 'KNOWLEDGE', 'keywords': []}
+            context, sources = '', []
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                classify_future = executor.submit(classify_question)
+                context_future = executor.submit(get_context)
+
+                for future in as_completed([classify_future, context_future]):
+                    try:
+                        result = future.result()
+                        if future == classify_future:
+                            classification = result
+                        else:
+                            context, sources = result
+                    except Exception as e:
+                        logger.error(f"Parallel processing error: {e}")
 
             question_type = classification.get('type', 'KNOWLEDGE')
             keywords = classification.get('keywords', [])
 
-            # Stage 2: Based on classification, decide RAG usage
             if question_type == 'SYSTEM':
-                context, sources = '', []
-                yield self._sse_event('status', {'message': 'Handling system question...'})
+                yield self._sse_event('status', {'message': 'Generating response...'})
             elif question_type == 'KNOWLEDGE':
-                yield self._sse_event('status', {'message': 'Searching knowledge base...'})
-                context, sources = self.get_rag_context(user_message, effective_custom_model_id)
                 if sources:
                     yield self._sse_event('sources', {'sources': sources})
-            else:
-                context, sources = '', []
                 yield self._sse_event('status', {'message': 'Generating response...'})
-            
+            else:
+                yield self._sse_event('status', {'message': 'Generating response...'})
+
             history = self.get_conversation_history(conversation_id, limit=10)
             messages = self.build_prompt_with_context(user_message, context, sources, system_prompt)
-            
+
             if len(history) > 1:
                 for msg in history[:-1]:
                     messages.insert(1, msg)
-            
-            yield self._sse_event('status', {'message': 'Generating response...'})
-            
+
             full_content = ''
             thinking_content = ''
             is_thinking = False
             thinking_started_at = None
             thinking_duration = 0
-            
+
+            # Create a placeholder assistant message at the start
+            assistant_msg = self.add_message(
+                conversation_id,
+                'assistant',
+                '',
+                thinking_content='',
+                sources=sources if sources else None
+            )
+            assistant_message_id = assistant_msg.id
+
+            # Track last save time for incremental saves
+            last_save_time = time.time()
+            save_interval = 2.0
+
             for chunk in self.ollama_service.chat_stream(base_model, messages):
                 if 'message' in chunk:
                     msg = chunk['message']
-                    
+
                     # Handle thinking field (Ollama think=True returns separate field)
                     thinking_token = msg.get('thinking', '')
                     content_token = msg.get('content', '')
-                    
+
                     if thinking_token:
                         if not is_thinking:
                             is_thinking = True
@@ -740,7 +845,7 @@ If the context doesn't contain relevant information, answer based on your genera
                             yield self._sse_event('thinking_start', {})
                         thinking_content += thinking_token
                         yield self._sse_event('thinking', {'content': thinking_token})
-                    
+
                     if content_token:
                         if is_thinking:
                             is_thinking = False
@@ -751,7 +856,19 @@ If the context doesn't contain relevant information, answer based on your genera
                             })
                         full_content += content_token
                         yield self._sse_event('content', {'content': content_token})
-                
+
+                    # Incremental save every 2 seconds
+                    current_time = time.time()
+                    if current_time - last_save_time >= save_interval:
+                        try:
+                            assistant_msg.content = full_content
+                            assistant_msg.thinking_content = thinking_content if thinking_content else None
+                            db.session.commit()
+                            last_save_time = current_time
+                        except Exception as save_error:
+                            logger.warning(f"Incremental save failed: {save_error}")
+                            db.session.rollback()
+
                 if chunk.get('done', False):
                     if is_thinking:
                         is_thinking = False
@@ -761,12 +878,24 @@ If the context doesn't contain relevant information, answer based on your genera
                             'duration': thinking_duration
                         })
                     break
-            
-            assistant_msg = self.add_message(
-                conversation_id, 'assistant', full_content,
-                thinking_content=thinking_content if thinking_content else None,
-                sources=sources if sources else None
-            )
+
+            # Final save of the complete message
+            try:
+                assistant_msg.content = full_content
+                assistant_msg.thinking_content = thinking_content if thinking_content else None
+                db.session.commit()
+            except Exception as save_error:
+                logger.error(f"Final message save failed: {save_error}")
+                db.session.rollback()
+                # Try one more time with fresh session
+                try:
+                    assistant_msg = Message.query.get(assistant_message_id)
+                    if assistant_msg:
+                        assistant_msg.content = full_content
+                        assistant_msg.thinking_content = thinking_content if thinking_content else None
+                        db.session.commit()
+                except Exception as retry_error:
+                    logger.error(f"Retry save failed: {retry_error}")
             
             yield self._sse_event('done', {
                 'message_id': assistant_msg.id,

@@ -104,7 +104,7 @@ export function clearAllCache() {
 
 // Cache TTL constants (milliseconds)
 export const CACHE_TTL = {
-  MODELS: 5 * 60 * 1000,       // 5 minutes
-  CONVERSATIONS: 30 * 1000,     // 30 seconds
-  MESSAGES: 2 * 60 * 1000       // 2 minutes
+  MODELS: 10 * 60 * 1000,       // 10 minutes - models don't change often
+  CONVERSATIONS: 60 * 1000,     // 1 minute - conversation list changes moderately
+  MESSAGES: 10 * 60 * 1000      // 10 minutes - messages are immutable once sent
 }

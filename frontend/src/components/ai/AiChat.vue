@@ -18,33 +18,59 @@
       <div class="header-center">
         <slot name="header-center">
           <!-- 模型选择器 -->
-          <el-select
+          <el-popover
             v-if="showModelSelector"
-            v-model="selectedModel"
-            placeholder="选择模型"
-            class="model-selector"
-            :disabled="isStreaming"
+            v-model:visible="modelSelectorVisible"
+            placement="bottom"
+            :width="360"
+            trigger="click"
+            popper-class="model-selector-popover"
           >
-            <el-option-group
-              v-for="group in modelGroups"
-              :key="group.label"
-              :label="group.label"
-            >
-              <el-option
-                v-for="model in group.models"
-                :key="model.id"
-                :label="model.name"
-                :value="model.id"
+            <template #reference>
+              <el-button
+                class="model-selector-btn"
+                :disabled="isStreaming"
               >
-                <div class="model-option">
-                  <div class="model-option-info">
-                    <span class="model-name">{{ model.name }}</span>
-                    <el-tag v-if="model.tag" size="small" effect="plain" class="model-tag">{{ model.tag }}</el-tag>
+                <span class="model-name">{{ currentModelName }}</span>
+                <el-icon class="dropdown-icon"><ArrowDown /></el-icon>
+              </el-button>
+            </template>
+
+            <div class="model-selector-dropdown">
+              <div class="model-groups">
+                <div
+                  v-for="group in modelGroups"
+                  :key="group.label"
+                  class="model-group"
+                >
+                  <div class="group-label">{{ group.label }}</div>
+                  <div class="model-list">
+                    <div
+                      v-for="model in group.models"
+                      :key="model.id"
+                      class="model-item"
+                      :class="{ active: selectedModel === model.id }"
+                      @click="selectModel(model.id)"
+                    >
+                      <div class="model-info">
+                        <span class="model-name">{{ model.name }}</span>
+                        <el-tag v-if="model.tag" size="small" effect="plain" class="model-tag">{{ model.tag }}</el-tag>
+                      </div>
+                      <el-checkbox
+                        v-if="selectedModel === model.id"
+                        v-model="isDefaultModel"
+                        size="small"
+                        @click.stop
+                        @change="handleSetDefault(model.id)"
+                      >
+                        设为默认
+                      </el-checkbox>
+                    </div>
                   </div>
                 </div>
-              </el-option>
-            </el-option-group>
-          </el-select>
+              </div>
+            </div>
+          </el-popover>
         </slot>
       </div>
       
@@ -74,7 +100,6 @@
       <!-- 消息列表 -->
       <BubbleList
         v-else-if="bubbleList.length > 0"
-        :key="bubbleListKey"
         :list="bubbleList"
         :typing="false"
         :loading="false"
@@ -195,7 +220,7 @@
 </template>
 
 <script setup>
-import { ref, computed, watch, nextTick, onMounted } from 'vue'
+import { ref, computed, watch, nextTick, onMounted, onUnmounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
   Expand,
@@ -206,7 +231,8 @@ import {
   ArrowDown,
   Microphone,
   VideoPause,
-  Promotion
+  Promotion,
+  Check
 } from '@element-plus/icons-vue'
 import { Welcome, Prompts, BubbleList } from 'vue-element-plus-x'
 import AiMessage from './AiMessage.vue'
@@ -264,14 +290,21 @@ const inputMessage = ref('')
 const selectedModel = ref(props.defaultModel)
 const messagesContainer = ref(null)
 const showScrollBtn = ref(false)
-const bubbleListKey = ref(0)
+const modelSelectorVisible = ref(false)
+const isDefaultModel = ref(false)
 let userAtBottom = true
 
-// 计算属性
+// 计算属性 - 当前模型名称
+const currentModelName = computed(() => {
+  const model = props.models.find(m => m.id === selectedModel.value)
+  return model?.name || selectedModel.value || '选择模型'
+})
+
+// 计算属性 - 使用稳定的key避免不必要的重新渲染
 const bubbleList = computed(() => {
-  return props.messages.map(msg => ({
+  return props.messages.map((msg, index) => ({
     ...msg,
-    key: msg.id || `msg-${Date.now()}-${Math.random()}`,
+    key: msg.id || `msg-${index}`,
     placement: msg.role === 'user' ? 'end' : 'start',
     loading: msg.loading || false
   }))
@@ -304,6 +337,32 @@ function toggleSidebar() {
   emit('update:sidebarCollapsed', !props.sidebarCollapsed)
 }
 
+// 选择模型
+function selectModel(modelId) {
+  selectedModel.value = modelId
+  emit('update:model', modelId)
+  modelSelectorVisible.value = false
+
+  // Check if this model is the default
+  const savedDefault = localStorage.getItem('sfqa_default_model')
+  isDefaultModel.value = savedDefault === modelId
+}
+
+// 设置默认模型
+function handleSetDefault(modelId) {
+  if (isDefaultModel.value) {
+    localStorage.setItem('sfqa_default_model', modelId)
+    ElMessage.success(`已将 ${currentModelName.value} 设为默认模型`)
+  } else {
+    // User unchecked the default option
+    const savedDefault = localStorage.getItem('sfqa_default_model')
+    if (savedDefault === modelId) {
+      localStorage.removeItem('sfqa_default_model')
+      ElMessage.info('已取消默认模型设置')
+    }
+  }
+}
+
 function handleSend() {
   if (!inputMessage.value.trim()) return
 
@@ -316,7 +375,6 @@ function handleSend() {
       const messageToSend = inputMessage.value.trim()
       emit('stop')
       nextTick(() => {
-        bubbleListKey.value++
         emit('send', {
           content: messageToSend,
           model: selectedModel.value
@@ -325,7 +383,6 @@ function handleSend() {
       })
     }).catch(() => {})
   } else {
-    bubbleListKey.value++
     emit('send', {
       content: inputMessage.value.trim(),
       model: selectedModel.value
@@ -397,50 +454,161 @@ function isLastUserMessage(item) {
   return false
 }
 
+// ==================== Scroll Handling with Safety Checks ====================
+
+/**
+ * Safely check if scroll position is near bottom
+ * Includes null checks to prevent errors when DOM is not ready
+ */
 function isNearBottom() {
   const el = messagesContainer.value
-  if (!el) return true
+  if (!el || typeof el.scrollHeight === 'undefined' || typeof el.scrollTop === 'undefined' || typeof el.clientHeight === 'undefined') {
+    return true
+  }
   return el.scrollHeight - el.scrollTop - el.clientHeight < 100
 }
 
+/**
+ * Handle scroll events to track user position
+ */
 function onScroll() {
   userAtBottom = isNearBottom()
   showScrollBtn.value = !userAtBottom
 }
 
+/**
+ * Safely scroll to bottom with comprehensive null checks
+ * Uses requestAnimationFrame for better performance and safety
+ */
 function scrollToBottom(force = false) {
+  // Skip if user has scrolled up (unless forced) or container not available
   if (!force && !userAtBottom) return
-  nextTick(() => {
-    if (messagesContainer.value) {
-      messagesContainer.value.scrollTop = messagesContainer.value.scrollHeight
-      userAtBottom = true
-      showScrollBtn.value = false
-    }
+
+  // Use requestAnimationFrame to ensure DOM is ready
+  requestAnimationFrame(() => {
+    nextTick(() => {
+      const el = messagesContainer.value
+
+      // Comprehensive null and type checking
+      if (!el || !(el instanceof Element)) {
+        console.debug('scrollToBottom: Container not available')
+        return
+      }
+
+      // Check if element is connected to DOM and visible
+      if (!el.isConnected) {
+        console.debug('scrollToBottom: Container not connected to DOM')
+        return
+      }
+
+      // Safely access scroll properties with default values
+      const scrollHeight = el.scrollHeight ?? 0
+      const clientHeight = el.clientHeight ?? 0
+
+      // Only scroll if there's actual content to scroll
+      if (scrollHeight > clientHeight) {
+        try {
+          el.scrollTop = scrollHeight
+          userAtBottom = true
+          showScrollBtn.value = false
+        } catch (e) {
+          console.warn('scrollToBottom: Error during scroll', e)
+        }
+      }
+    })
   })
 }
 
-// 监听
-watch(() => props.messages, () => {
-  scrollToBottom()
-}, { deep: true })
+/**
+ * Safe scroll with retry mechanism for v-if conditions
+ */
+function scrollToBottomSafe(force = false, maxRetries = 3) {
+  let attempts = 0
 
-watch(() => props.isStreaming, (val) => {
-  if (val) {
-    scrollToBottom(true)
-  } else {
-    nextTick(() => {
-      scrollToBottom(true)
-    })
+  const attemptScroll = () => {
+    const el = messagesContainer.value
+
+    if (el && el.isConnected) {
+      scrollToBottom(force)
+      return true
+    }
+
+    attempts++
+    if (attempts < maxRetries) {
+      // Retry after a short delay
+      setTimeout(attemptScroll, 100)
+    }
+    return false
+  }
+
+  attemptScroll()
+}
+
+// ==================== Watchers with Safety ====================
+
+// Watch messages and scroll to bottom on new messages
+watch(() => props.messages, (newMessages, oldMessages) => {
+  // Only scroll if messages actually changed and increased
+  if (newMessages && oldMessages && newMessages.length > oldMessages.length) {
+    scrollToBottomSafe()
+  }
+}, { deep: true, flush: 'post' })
+
+// Watch streaming state
+watch(() => props.isStreaming, (val, oldVal) => {
+  if (val && !oldVal) {
+    // Started streaming - force scroll
+    scrollToBottomSafe(true)
+  } else if (!val && oldVal) {
+    // Finished streaming - scroll after content settles
+    setTimeout(() => scrollToBottomSafe(true), 100)
+  }
+})
+
+// Watch for container visibility changes (v-if conditions)
+watch(messagesContainer, (el) => {
+  if (el) {
+    // Container became available - attach scroll listener and scroll
+    el.addEventListener('scroll', onScroll)
+    scrollToBottomSafe(true)
   }
 })
 
 watch(selectedModel, (val) => {
   emit('update:model', val)
+
+  // Update isDefaultModel checkbox state when model changes
+  const savedDefault = localStorage.getItem('sfqa_default_model')
+  isDefaultModel.value = savedDefault === val
 })
 
+// Watch for external defaultModel changes
+watch(() => props.defaultModel, (val) => {
+  if (val && val !== selectedModel.value) {
+    selectedModel.value = val
+  }
+})
+
+// Initialize isDefaultModel on mount
 onMounted(() => {
-  if (messagesContainer.value) {
-    messagesContainer.value.addEventListener('scroll', onScroll)
+  const savedDefault = localStorage.getItem('sfqa_default_model')
+  isDefaultModel.value = savedDefault === selectedModel.value
+})
+
+// ==================== Lifecycle ====================
+
+onMounted(() => {
+  // Delay scroll to ensure DOM is fully rendered
+  setTimeout(() => {
+    scrollToBottomSafe(true)
+  }, 50)
+})
+
+onUnmounted(() => {
+  // Clean up scroll listener
+  const el = messagesContainer.value
+  if (el) {
+    el.removeEventListener('scroll', onScroll)
   }
 })
 </script>
@@ -487,44 +655,47 @@ onMounted(() => {
     align-items: center;
     gap: 8px;
 
-    .model-selector {
-      width: 240px;
+    .model-selector-btn {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 10px 20px;
+      border-radius: 14px;
+      background: rgba(99, 102, 241, 0.06);
+      border: 1px solid rgba(99, 102, 241, 0.12);
+      color: #1E1B4B;
+      font-weight: 600;
+      font-size: 15px;
+      transition: all 0.25s ease;
+      min-width: 160px;
+      justify-content: space-between;
 
-      :deep(.el-input__wrapper) {
-        border-radius: 12px;
-        box-shadow: none;
-        background: rgba(99, 102, 241, 0.06);
-        border: 1px solid rgba(99, 102, 241, 0.12);
-        transition: all 0.25s ease;
-        padding: 4px 14px;
-
-        &:hover {
-          background: rgba(99, 102, 241, 0.1);
-          border-color: rgba(99, 102, 241, 0.22);
-        }
-
-        &.is-focus {
-          background: rgba(255, 255, 255, 0.95);
-          border-color: #6366F1;
-          box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.12);
-        }
+      &:hover {
+        background: rgba(99, 102, 241, 0.1);
+        border-color: rgba(99, 102, 241, 0.22);
+        box-shadow: 0 4px 12px rgba(99, 102, 241, 0.15);
       }
 
-      :deep(.el-select__caret) {
+      &:active {
+        background: rgba(99, 102, 241, 0.14);
+        transform: scale(0.98);
+      }
+
+      .model-name {
+        max-width: 200px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .dropdown-icon {
         color: #6366F1;
-        font-weight: 700;
         font-size: 16px;
+        transition: transform 0.25s ease;
       }
 
-      :deep(.el-input__inner) {
-        color: #1E1B4B;
-        font-weight: 600;
-        font-size: 15px;
-
-        &::placeholder {
-          color: #A5A3C9;
-          font-size: 15px;
-        }
+      &[aria-expanded="true"] .dropdown-icon {
+        transform: rotate(180deg);
       }
     }
   }
@@ -538,6 +709,121 @@ onMounted(() => {
   }
 }
 
+:deep(.model-selector-popover) {
+  padding: 0 !important;
+  border-radius: 16px;
+  box-shadow: 0 12px 40px rgba(99, 102, 241, 0.2);
+  border: 1px solid rgba(99, 102, 241, 0.12);
+  overflow: hidden;
+}
+
+.model-selector-dropdown {
+  max-height: 480px;
+  overflow-y: auto;
+
+  .model-groups {
+    padding: 12px 0;
+  }
+
+  .model-group {
+    &:not(:last-child) {
+      margin-bottom: 8px;
+      padding-bottom: 8px;
+      border-bottom: 1px solid rgba(99, 102, 241, 0.06);
+    }
+
+    .group-label {
+      padding: 12px 24px;
+      font-size: 13px;
+      font-weight: 600;
+      color: #6B7280;
+      text-transform: uppercase;
+      letter-spacing: 0.8px;
+    }
+
+    .model-list {
+      .model-item {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 16px 24px;
+        margin: 4px 12px;
+        cursor: pointer;
+        transition: all 0.25s ease;
+        border-radius: 12px;
+        border: 2px solid transparent;
+
+        &:hover {
+          background: rgba(99, 102, 241, 0.06);
+          border-color: rgba(99, 102, 241, 0.1);
+        }
+
+        &.active {
+          background: linear-gradient(135deg, rgba(99, 102, 241, 0.12) 0%, rgba(124, 58, 210, 0.08) 100%);
+          border-color: rgba(99, 102, 241, 0.25);
+
+          .model-name {
+            color: #4F46E5;
+            font-weight: 700;
+          }
+        }
+
+        .model-info {
+          display: flex;
+          align-items: center;
+          gap: 16px;
+          flex: 1;
+          min-width: 0;
+
+          .model-name {
+            font-size: 15px;
+            font-weight: 600;
+            color: #1E1B4B;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+          }
+
+          .model-tag {
+            border-radius: 8px;
+            font-weight: 500;
+            font-size: 12px;
+            background: rgba(99, 102, 241, 0.1);
+            border-color: rgba(99, 102, 241, 0.25);
+            color: #6366F1;
+            padding: 4px 12px;
+            flex-shrink: 0;
+          }
+        }
+
+        :deep(.el-checkbox) {
+          margin-right: 0;
+          margin-left: 16px;
+          flex-shrink: 0;
+
+          .el-checkbox__label {
+            font-size: 13px;
+            color: #6366F1;
+            padding-left: 6px;
+            font-weight: 500;
+          }
+
+          .el-checkbox__input.is-checked .el-checkbox__inner {
+            background-color: #6366F1;
+            border-color: #6366F1;
+          }
+
+          .el-checkbox__inner {
+            width: 18px;
+            height: 18px;
+          }
+        }
+      }
+    }
+  }
+}
+
+// Legacy styles for backward compatibility
 .model-option {
   display: flex;
   align-items: center;

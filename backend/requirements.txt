@@ -41,3 +41,7 @@ reportlab==4.0.8
 
 # Async
 gevent==23.9.1
+
+# Knowledge Graph (Neo4j GraphRAG)
+neo4j-graphrag[ollama,openai,experimental]>=1.7.0
+neo4j>=5.18.0
