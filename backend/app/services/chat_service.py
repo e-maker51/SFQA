@@ -13,7 +13,7 @@ import logging
 from ..extensions import db
 from ..models import Conversation, Message, CustomModel, KnowledgeBase, ModelKnowledgeBinding
 from .rag_service import get_rag_service
-from .ollama_service import get_ollama_service
+from .llm_factory import get_llm_service, get_llm_provider
 from ..utils.rag_template import get_source_context, format_rag_prompt
 
 logger = logging.getLogger(__name__)
@@ -70,23 +70,23 @@ JSON响应："""
 class QuestionClassifier:
     """Fast question classifier using LLM"""
 
-    def __init__(self, ollama_service):
-        self.ollama_service = ollama_service
+    def __init__(self, llm_service):
+        self.llm_service = llm_service
 
     def classify(self, question: str, model: str = None) -> Dict[str, Any]:
         """
         Classify user question using LLM (no thinking).
         Returns: {"type": "SYSTEM"|"KNOWLEDGE"|"GENERAL", "keywords": [...]}
         """
-        model = model or 'qwen3:14b'
+        model = model or self.llm_service.get_default_model()
 
         prompt = QUESTION_CLASSIFIER_TEMPLATE.replace('{{QUESTION}}', question)
 
         try:
-            response = self.ollama_service.chat(
+            response = self.llm_service.chat(
                 model=model,
                 messages=[{'role': 'user', 'content': prompt}],
-                options={'temperature': 0.1, 'think': False}
+                options={'temperature': 0.1}
             )
 
             response = response.strip()
@@ -117,22 +117,22 @@ class QuestionClassifier:
 
 class ChatService:
     """Service for handling chat operations"""
-    
+
     def __init__(self):
         self._rag_service = None
-        self._ollama_service = None
-    
+        self._llm_service = None
+
     @property
     def rag_service(self):
         if self._rag_service is None:
             self._rag_service = get_rag_service()
         return self._rag_service
-    
+
     @property
-    def ollama_service(self):
-        if self._ollama_service is None:
-            self._ollama_service = get_ollama_service()
-        return self._ollama_service
+    def llm_service(self):
+        if self._llm_service is None:
+            self._llm_service = get_llm_service()
+        return self._llm_service
     
     # ==================== Conversation CRUD ====================
     
@@ -476,7 +476,7 @@ If the context doesn't contain relevant information, answer based on your genera
             def classify_question():
                 """Classify question in background thread"""
                 try:
-                    classifier = QuestionClassifier(self.ollama_service)
+                    classifier = QuestionClassifier(self.llm_service)
                     return classifier.classify(user_message, base_model)
                 except Exception as e:
                     logger.warning(f"Classification failed: {e}")
@@ -565,7 +565,7 @@ If the context doesn't contain relevant information, answer based on your genera
             last_save_time = time.time()
             save_interval = 2.0  # Save every 2 seconds
 
-            for chunk in self.ollama_service.chat_stream(base_model, messages):
+            for chunk in self.llm_service.chat_stream(base_model, messages):
                 if 'message' in chunk:
                     msg = chunk['message']
 
@@ -759,7 +759,7 @@ If the context doesn't contain relevant information, answer based on your genera
 
             def classify_question():
                 try:
-                    classifier = QuestionClassifier(self.ollama_service)
+                    classifier = QuestionClassifier(self.llm_service)
                     return classifier.classify(user_message, base_model)
                 except Exception as e:
                     logger.warning(f"Classification failed: {e}")
@@ -830,7 +830,7 @@ If the context doesn't contain relevant information, answer based on your genera
             last_save_time = time.time()
             save_interval = 2.0
 
-            for chunk in self.ollama_service.chat_stream(base_model, messages):
+            for chunk in self.llm_service.chat_stream(base_model, messages):
                 if 'message' in chunk:
                     msg = chunk['message']
 

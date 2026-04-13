@@ -7,21 +7,22 @@ from . import model_bp
 from ..utils.response import success_response, error_response
 from ..models import CustomModel, KnowledgeBase, ModelKnowledgeBinding
 from ..extensions import db
-from ..services import get_ollama_service
+from ..services import get_llm_service, get_llm_provider
 
 
 @model_bp.route('/ollama', methods=['GET'])
 @jwt_required()
 def get_ollama_models():
-    """Get available Ollama models"""
-    ollama = get_ollama_service()
-    models = ollama.get_models()
-    
+    """Get available LLM models (Ollama or llama.cpp)"""
+    llm = get_llm_service()
+    models = llm.get_models()
+
     return success_response(
         data=[{
             'name': m.get('name', ''),
             'size': m.get('size', 0),
-            'modified_at': m.get('modified_at', '')
+            'modified_at': m.get('modified_at', ''),
+            'provider': get_llm_provider()
         } for m in models]
     )
 
@@ -205,3 +206,21 @@ def unbind_knowledge_base(model_id, kb_id):
     except Exception as e:
         db.session.rollback()
         return error_response(400, str(e))
+
+
+@model_bp.route('/health', methods=['GET'])
+@jwt_required()
+def get_llm_health():
+    """Get LLM service health status"""
+    llm = get_llm_service()
+    provider = get_llm_provider()
+
+    is_available = llm.is_available()
+
+    return success_response(
+        data={
+            'provider': provider,
+            'available': is_available,
+            'default_model': llm.get_default_model() if is_available else None
+        }
+    )

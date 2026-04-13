@@ -46,10 +46,20 @@ class Config:
     CELERY_BROKER_URL = os.getenv('CELERY_BROKER_URL', 'redis://localhost:6379/1')
     CELERY_RESULT_BACKEND = os.getenv('CELERY_RESULT_BACKEND', 'redis://localhost:6379/2')
     
+    # LLM Provider
+    LLM_PROVIDER = os.getenv('LLM_PROVIDER', 'ollama').lower()
+
     # Ollama
     OLLAMA_BASE_URL = os.getenv('OLLAMA_BASE_URL', 'http://localhost:11434')
     OLLAMA_EMBEDDING_MODEL = os.getenv('OLLAMA_EMBEDDING_MODEL', 'nomic-embed-text')
     OLLAMA_DEFAULT_MODEL = os.getenv('OLLAMA_DEFAULT_MODEL', 'qwen2.5:7b')
+
+    # llama.cpp
+    LLAMACPP_BASE_URL = os.getenv('LLAMACPP_BASE_URL', 'http://localhost:8080')
+    LLAMACPP_MODEL_PATH = os.getenv('LLAMACPP_MODEL_PATH', 'models/llama-model.gguf')
+    LLAMACPP_N_CTX = int(os.getenv('LLAMACPP_N_CTX', '4096'))
+    LLAMACPP_N_THREADS = int(os.getenv('LLAMACPP_N_THREADS', '4'))
+    LLAMACPP_N_BATCH = int(os.getenv('LLAMACPP_N_BATCH', '512'))
     
     # RAG Configuration
     CHUNK_SIZE = int(os.getenv('CHUNK_SIZE', 1000))
